@@ -47,16 +47,18 @@ public class ProductService {
     public Product update(Product product) {
         Product productResult = null;
         //RLock productUpdateLock = redisson.getLock(LOCK_PRODUCT_UPDATE_PREFIX + product.getId());
+//        RLock productUpdateLock = redisson.getLock(LOCK_PRODUCT_UPDATE_PREFIX + product.getId());
         RReadWriteLock productUpdateLock = redisson.getReadWriteLock(LOCK_PRODUCT_UPDATE_PREFIX + product.getId());
-        RLock writeLock = productUpdateLock.writeLock();
         //加分布式写锁解决缓存双写不一致问题
-        writeLock.lock();
+        RLock productUpdateWriteLock = productUpdateLock.writeLock();
+        productUpdateWriteLock.lock();
+//        productUpdateLock.lock();
         try {
             productResult = productDao.update(product);
             redisUtil.set(RedisKeyPrefixConst.PRODUCT_CACHE + productResult.getId(), JSON.toJSONString(productResult),
                     genProductCacheTimeout(), TimeUnit.SECONDS);
         } finally {
-            writeLock.unlock();
+            productUpdateWriteLock.unlock();
         }
         return productResult;
     }
@@ -79,9 +81,18 @@ public class ProductService {
             if (product != null) {
                 return product;
             }
-
-            // set cache data
-            setProductCacheFromDB(productId, productCacheKey);
+            // distribution lock enable 双写一致性
+            RReadWriteLock productUpdateLock = redisson.getReadWriteLock(LOCK_PRODUCT_UPDATE_PREFIX + productId);
+            RLock productUpdateReadLock = productUpdateLock.readLock();
+//            RLock productUpdateLock = redisson.getLock(LOCK_PRODUCT_UPDATE_PREFIX + productId);
+            // 添加读锁解决读写一致性问题
+            productUpdateReadLock.lock();
+            try {
+                // set cache data
+                setProductCacheFromDB(productId, productCacheKey);
+            } finally {
+                productUpdateReadLock.unlock();
+            }
         } finally {
             hotCreatedCacheLock.unlock();
         }
