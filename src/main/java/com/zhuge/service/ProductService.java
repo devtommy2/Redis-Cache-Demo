@@ -5,6 +5,7 @@ import com.zhuge.common.RedisKeyPrefixConst;
 import com.zhuge.common.RedisUtil;
 import com.zhuge.dao.ProductDao;
 import com.zhuge.model.Product;
+import jodd.datetime.TimeUtil;
 import org.redisson.Redisson;
 import org.redisson.api.RLock;
 import org.redisson.api.RReadWriteLock;
@@ -13,6 +14,7 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.util.StringUtils;
 
+import java.sql.Time;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Random;
@@ -46,12 +48,17 @@ public class ProductService {
     @Transactional
     public Product update(Product product) {
         Product productResult = null;
-        //RLock productUpdateLock = redisson.getLock(LOCK_PRODUCT_UPDATE_PREFIX + product.getId());
+        // 分布式锁，效率低
 //        RLock productUpdateLock = redisson.getLock(LOCK_PRODUCT_UPDATE_PREFIX + product.getId());
+
+        // 用读写锁优化分布式锁
         RReadWriteLock productUpdateLock = redisson.getReadWriteLock(LOCK_PRODUCT_UPDATE_PREFIX + product.getId());
-        //加分布式写锁解决缓存双写不一致问题
+        // 加分布式写锁解决缓存双写不一致问题
         RLock productUpdateWriteLock = productUpdateLock.writeLock();
+        // 写锁加锁
         productUpdateWriteLock.lock();
+
+        // 分布式锁加锁
 //        productUpdateLock.lock();
         try {
             productResult = productDao.update(product);
@@ -73,9 +80,18 @@ public class ProductService {
             return product;
         }
 
-        // add distribution lock
+        // add distribution lock 热点缓存重建
         RLock hotCreatedCacheLock = redisson.getLock(LOCK_PRODUCT_HOT_CACHE_CREATE_PREFIX + productId);
-        hotCreatedCacheLock.lock();
+        // 热点缓存数据重建问题，用分布式锁的写法
+//        hotCreatedCacheLock.lock();
+        // 热点缓存数据重建问题，用tryLock优化的写法（优化版本，两个方法都行，二选一）
+        try {
+            // 使用 tryLock，等缓存热点在1s内重建完毕，tryLock会自动超时释放，但是需要保证缓存重建逻辑一定在指定的time内完成
+            // 但是通常我们不能做这个保证，因为有很多的意外发生，所以这就是tryLock的缺点之处。
+            hotCreatedCacheLock.tryLock(1, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            throw new RuntimeException(e);
+        }
         try {
             product = getProductFromCache(productCacheKey);
             if (product != null) {
@@ -84,7 +100,6 @@ public class ProductService {
             // distribution lock enable 双写一致性
             RReadWriteLock productUpdateLock = redisson.getReadWriteLock(LOCK_PRODUCT_UPDATE_PREFIX + productId);
             RLock productUpdateReadLock = productUpdateLock.readLock();
-//            RLock productUpdateLock = redisson.getLock(LOCK_PRODUCT_UPDATE_PREFIX + productId);
             // 添加读锁解决读写一致性问题
             productUpdateReadLock.lock();
             try {
